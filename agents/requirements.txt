@@ -1,0 +1,30 @@
+# FastAPI & Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Streamlit Frontend
+streamlit>=1.29.0
+
+# LangChain & AI
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+langgraph>=0.2.0
+
+# PDF Processing
+pypdf>=4.0.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Alibaba Cloud DashScope (Qwen)
+dashscope>=1.14.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+httpx>=0.25.0
+pillow>=10.0.0
+aiofiles>=23.0.0
