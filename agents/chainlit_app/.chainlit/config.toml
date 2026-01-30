@@ -1,0 +1,48 @@
+[project]
+# 项目名称
+name = "多模态智能 Agent"
+
+# 禁用遥测
+enable_telemetry = false
+
+[features]
+# 允许用户自发上传文件
+# 允许用户自发上传文件
+[features.spontaneous_file_upload]
+enabled = true
+accept = ["*/*"]
+max_size_mb = 500
+max_files = 20
+
+# 启用多模态支持
+[features.multi_modal]
+enabled = true
+accept = ["image/*"]
+max_size_mb = 20
+max_files = 10
+
+# 启用安全的上传文件最大大小 (MB)
+# max_upload_size = 50
+
+# 支持的文件类型
+# 留空表示支持所有类型
+
+[UI]
+# UI 显示名称
+name = "多模态智能 Agent"
+
+# 默认主题 (light / dark)
+default_theme = "dark"
+
+# 隐藏 Chainlit 水印
+hide_cot = false
+
+# 启用快速反馈
+show_readme_as_default = false
+
+# GitHub 链接 (留空隐藏)
+github = ""
+
+[meta]
+# 生成的会话 ID
+generated_by = "chainlit"
