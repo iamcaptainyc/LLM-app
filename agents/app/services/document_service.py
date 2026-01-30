@@ -1,17 +1,25 @@
 """
 文档解析服务
-支持PDF和TXT文件的解析与索引
+使用 LangChain Loaders 支持多种格式 (PDF, DOCX, TXT, etc.)
 """
 
-import io
+import os
+import tempfile
 from typing import List, Tuple, Optional
 from pathlib import Path
 
-from pypdf import PdfReader
+# LangChain Loaders
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+    UnstructuredFileLoader
+)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 class DocumentService:
-    """文档解析服务"""
+    """文档解析服务 (LangChain版)"""
     
     def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
         """
@@ -23,172 +31,32 @@ class DocumentService:
         """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        
+        # 初始化通用的文本分割器
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " ", ""]
+        )
     
-    def parse_pdf(self, file_bytes: bytes) -> Tuple[str, dict]:
+    def _get_loader(self, file_path: str):
         """
-        解析PDF文件
+        根据文件扩展名获取合适的 Loader
+        """
+        ext = Path(file_path).suffix.lower()
         
-        Args:
-            file_bytes: PDF文件字节数据
-            
-        Returns:
-            (提取的文本, 元数据)
-        """
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            
-            # 提取所有页面文本
-            text_parts = []
-            for page_num, page in enumerate(reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    text_parts.append(page_text)
-            
-            full_text = "\n\n".join(text_parts)
-            
-            # 提取元数据
-            metadata = {
-                "page_count": len(reader.pages),
-                "file_type": "pdf",
-            }
-            
-            # 尝试获取PDF元数据
-            if reader.metadata:
-                if reader.metadata.title:
-                    metadata["title"] = reader.metadata.title
-                if reader.metadata.author:
-                    metadata["author"] = reader.metadata.author
-            
-            return full_text, metadata
-            
-        except Exception as e:
-            raise ValueError(f"PDF解析失败: {str(e)}")
-    
-    def parse_txt(self, file_bytes: bytes, encoding: str = "utf-8") -> Tuple[str, dict]:
-        """
-        解析TXT文件
-        
-        Args:
-            file_bytes: TXT文件字节数据
-            encoding: 文件编码
-            
-        Returns:
-            (文本内容, 元数据)
-        """
-        try:
-            # 尝试多种编码
-            encodings = [encoding, "utf-8", "gbk", "gb2312", "latin-1"]
-            
-            for enc in encodings:
-                try:
-                    text = file_bytes.decode(enc)
-                    return text, {"file_type": "txt", "encoding": enc}
-                except UnicodeDecodeError:
-                    continue
-            
-            # 最后使用errors='replace'
-            text = file_bytes.decode("utf-8", errors="replace")
-            return text, {"file_type": "txt", "encoding": "utf-8-replace"}
-            
-        except Exception as e:
-            raise ValueError(f"TXT解析失败: {str(e)}")
-    
-    def parse_file(self, file_bytes: bytes, filename: str) -> Tuple[str, dict]:
-        """
-        根据文件名自动解析文件
-        
-        Args:
-            file_bytes: 文件字节数据
-            filename: 文件名
-            
-        Returns:
-            (文本内容, 元数据)
-        """
-        suffix = Path(filename).suffix.lower()
-        
-        if suffix == ".pdf":
-            text, metadata = self.parse_pdf(file_bytes)
-        elif suffix in [".txt", ".md", ".text"]:
-            text, metadata = self.parse_txt(file_bytes)
+        if ext == ".pdf":
+            return PyPDFLoader(file_path)
+        elif ext == ".docx":
+            return Docx2txtLoader(file_path)
+        elif ext in [".txt", ".md", ".py", ".json", ".csv"]:
+            # 尝试使用 TextLoader，即使失败也可以回退
+            return TextLoader(file_path, autodetect_encoding=True)
         else:
-            raise ValueError(f"不支持的文件类型: {suffix}")
-        
-        metadata["filename"] = filename
-        return text, metadata
-    
-    def chunk_text(self, text: str) -> List[str]:
-        """
-        将文本分块
-        
-        Args:
-            text: 原始文本
-            
-        Returns:
-            文本块列表
-        """
-        if len(text) <= self.chunk_size:
-            return [text.strip()] if text.strip() else []
-        
-        chunks = []
-        
-        # 按段落分割
-        paragraphs = text.split("\n\n")
-        current_chunk = ""
-        
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-            
-            # 如果当前段落加上现有内容不超过限制
-            if len(current_chunk) + len(para) + 2 <= self.chunk_size:
-                current_chunk += ("\n\n" if current_chunk else "") + para
-            else:
-                # 保存当前块
-                if current_chunk:
-                    chunks.append(current_chunk)
-                
-                # 如果段落本身太长，需要进一步分割
-                if len(para) > self.chunk_size:
-                    sub_chunks = self._split_long_paragraph(para)
-                    chunks.extend(sub_chunks[:-1])
-                    current_chunk = sub_chunks[-1] if sub_chunks else ""
-                else:
-                    current_chunk = para
-        
-        # 添加最后一块
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        return chunks
-    
-    def _split_long_paragraph(self, text: str) -> List[str]:
-        """分割长段落"""
-        chunks = []
-        start = 0
-        
-        while start < len(text):
-            end = start + self.chunk_size
-            
-            # 尝试在句子边界分割
-            if end < len(text):
-                # 寻找句号、问号、感叹号
-                for sep in ["。", "！", "？", ". ", "! ", "? "]:
-                    pos = text.rfind(sep, start, end)
-                    if pos > start:
-                        end = pos + len(sep)
-                        break
-            
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-            
-            start = end - self.chunk_overlap
-            if start < 0:
-                start = 0
-        
-        return chunks
-    
+            # 对于 .doc 或其他未知类型，尝试使用 Unstructured
+            # 注意: 需要安装 unstructured 和 python-magic (Windows上是 python-magic-bin)
+            return UnstructuredFileLoader(file_path)
+
     def process_file(self, file_bytes: bytes, filename: str) -> Tuple[List[str], dict]:
         """
         处理文件：解析并分块
@@ -200,16 +68,62 @@ class DocumentService:
         Returns:
             (文本块列表, 元数据)
         """
-        # 解析文件
-        text, metadata = self.parse_file(file_bytes, filename)
+        # 创建临时文件
+        suffix = Path(filename).suffix
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_path = temp_file.name
         
-        # 分块
-        chunks = self.chunk_text(text)
-        
-        metadata["chunk_count"] = len(chunks)
-        metadata["total_chars"] = len(text)
-        
-        return chunks, metadata
+        try:
+            # 写入临时文件
+            temp_file.write(file_bytes)
+            temp_file.close()
+            
+            # 获取 Loader
+            try:
+                loader = self._get_loader(temp_path)
+                docs = loader.load()
+            except Exception as e:
+                # 如果 TextLoader 失败，尝试 Unstructured
+                print(f"Primary loader failed for {filename}: {e}, retrying with Unstructured...")
+                try:
+                    loader = UnstructuredFileLoader(temp_path)
+                    docs = loader.load()
+                except Exception as e2:
+                    raise ValueError(f"无法解析文件 {filename}: {str(e)} | Retry: {str(e2)}")
+            
+            if not docs:
+                return [], {"filename": filename, "chunk_count": 0, "total_chars": 0}
+            
+            # 分割文本
+            chunks = self.text_splitter.split_documents(docs)
+            
+            # 提取文本内容和基本统计
+            chunk_texts = [chunk.page_content for chunk in chunks]
+            total_chars = sum(len(c) for c in chunk_texts)
+            
+            # 提取元数据 (取第一个文档的 metadata 作为基础，加上自定义字段)
+            base_metadata = docs[0].metadata if docs else {}
+            metadata = {
+                "filename": filename,
+                "file_type": suffix.lstrip("."),
+                "chunk_count": len(chunks),
+                "total_chars": total_chars,
+                # 保留 loader 提取的其他有用元数据 (如 source)
+                "source": base_metadata.get("source", filename) 
+            }
+            
+            return chunk_texts, metadata
+            
+        except Exception as e:
+            raise ValueError(f"文件处理失败: {str(e)}")
+            
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception as e:
+                    print(f"Error removing temp file {temp_path}: {e}")
 
 
 # 单例

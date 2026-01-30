@@ -98,7 +98,8 @@ async def chat_endpoint(request: ChatRequest):
             user_input=user_message_content,
             image_base64=request.image_base64,
             use_rag=request.use_rag,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_tools=request.use_tools
         )
         
         if result["success"]:
@@ -142,7 +143,8 @@ async def chat_stream_endpoint(request: ChatRequest):
                     user_input=user_message_content,
                     image_base64=request.image_base64,
                     use_rag=request.use_rag,
-                    session_id=request.session_id
+                    session_id=request.session_id,
+                    use_tools=request.use_tools
                 ):
                     yield f"data: {chunk}\n\n"
             except Exception as e:
@@ -226,6 +228,8 @@ async def delete_session(session_id: str):
         else:
             raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/sessions/{session_id}/history", tags=["Session"])
@@ -238,23 +242,24 @@ async def get_session_history(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def process_document_bg(
+async def process_document(
     content: bytes, 
     filename: str, 
     session_id: Optional[str],
     save_to_global: bool = False
-):
-    """后台处理上传文档
+) -> dict:
+    """处理上传文档 (同步)
     
     Args:
         content: 文件内容
         filename: 文件名
         session_id: 会话ID
         save_to_global: 是否保存到全局知识库（默认False，仅保存到会话级知识库）
+        
+    Returns:
+        处理结果字典
     """
-    global _upload_status
     try:
-        _upload_status[filename] = "processing"
         print(f"[Upload] Processing {filename}, session={session_id}, global={save_to_global}")
         
         # 处理文档
@@ -268,49 +273,56 @@ async def process_document_bg(
         # 存入向量库
         vector_service = get_vector_service()
         
+        success = False
+        message = ""
+        
         if save_to_global:
             # 保存到全局知识库
             success = await run_in_threadpool(vector_service.add_documents_to_global, chunks, metadatas)
-            print(f"[Upload] Added to global knowledge base: {success}")
+            scope = "全局知识库"
         elif session_id:
             # 保存到会话级知识库
             success = await run_in_threadpool(vector_service.add_documents_to_session, session_id, chunks, metadatas)
-            print(f"[Upload] Added to session knowledge base: {success}")
+            scope = "会话知识库"
         else:
             # 无 session_id 且不保存全局，默认保存到全局
             success = await run_in_threadpool(vector_service.add_documents_to_global, chunks, metadatas)
-            print(f"[Upload] No session_id, added to global: {success}")
+            scope = "全局知识库 (默认)"
         
-        if success and session_id:
-            # 添加到会话的上传文档列表
-            agent_service = get_agent_service()
-            agent_service.add_uploaded_document(filename, session_id)
-            _upload_status[filename] = "completed"
-            print(f"[Upload] Background processing success: {filename}")
-        elif success:
-            _upload_status[filename] = "completed"
-            print(f"[Upload] Background processing success (no session): {filename}")
+        if success:
+            if session_id:
+                # 添加到会话的上传文档列表
+                agent_service = get_agent_service()
+                agent_service.add_uploaded_document(filename, session_id)
+            
+            print(f"[Upload] Processing success: {filename} -> {scope}")
+            return {
+                "status": "completed",
+                "filename": filename,
+                "scope": scope,
+                "chunks": len(chunks),
+                "message": "文档处理完成"
+            }
         else:
-            _upload_status[filename] = "failed"
-            print(f"[Upload] Vector service returned failure for {filename}")
+            print(f"[Upload] Vector service returned failure for {filename}. Check vector_service logs.")
+            raise Exception("向量库处理失败 - vector_service returned False")
             
     except Exception as e:
-        _upload_status[filename] = "failed"
-        print(f"[Upload] Background processing failed for {filename}: {e}")
+        print(f"[Upload] Processing failed for {filename}: {e}")
         import traceback
         traceback.print_exc()
+        raise Exception(f"处理失败: {str(e)}")
 
 
 @app.post("/knowledge/upload", tags=["Knowledge"])
 async def upload_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     source: str = Form("uploaded_file"),
     session_id: Optional[str] = Form(None),
     save_to_global: bool = Form(False)
 ):
     """
-    上传文档到知识库 (后台处理)
+    上传文档到知识库 (同步处理)
     支持: PDF, TXT, MD
     
     Args:
@@ -330,25 +342,59 @@ async def upload_document(
         # 读取文件
         content = await file.read()
         
-        # 添加后台任务
-        background_tasks.add_task(
-            process_document_bg, 
+        # 同步处理
+        result = await process_document(
             content, 
             filename, 
             session_id,
             save_to_global
         )
         
-        scope = "全局知识库" if save_to_global else "会话知识库"
-        return {
-            "status": "processing",
-            "message": f"文档正在后台处理中，将保存到{scope}",
-            "filename": filename,
-            "save_to_global": save_to_global
-        }
+        return result
             
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/knowledge/add", tags=["Knowledge"])
+async def add_knowledge(content: str = Form(...), source: str = Form("manual")):
+    """手动添加知识到向量库"""
+    try:
+        vector_service = get_vector_service()
+        # 分块处理
+        chunks = []
+        chunk_size = 500
+        for i in range(0, len(content), chunk_size):
+            chunks.append(content[i:i + chunk_size])
+        
+        metadatas = [{"source": source, "chunk_index": i} for i in range(len(chunks))]
+        success = vector_service.add_documents(chunks, metadatas)
+        
+        if success:
+            return {"status": "success", "chunks": len(chunks), "source": source}
+        else:
+            raise HTTPException(status_code=500, detail="添加失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/knowledge/search", tags=["Knowledge"])
+async def search_knowledge(query: str = Form(...), n_results: int = Form(3)):
+    """搜索知识库"""
+    try:
+        vector_service = get_vector_service()
+        results = vector_service.search(query, n_results=n_results)
+        return {
+            "query": query,
+            "results": [
+                {"document": r["content"], "metadata": r.get("metadata", {}), "distance": r.get("distance", 0)}
+                for r in results
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

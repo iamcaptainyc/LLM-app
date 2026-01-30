@@ -115,8 +115,9 @@ class ReActAgentService:
         self.tools = get_all_tools()
         self.llm_with_tools = self.llm.bind_tools(self.tools)
         
-        # 构建工作流
-        self.graph = self._build_graph()
+        # 构建两个工作流:一个支持工具调用,一个不支持
+        self.graph_with_tools = self._build_graph(use_tools=True)
+        self.graph_no_tools = self._build_graph(use_tools=False)
         
         # 会话存储路径
         self.storage_dir = Path("data/sessions")
@@ -127,6 +128,7 @@ class ReActAgentService:
         
         # 加载所有会话
         self._load_all_sessions()
+
     
     def _load_all_sessions(self):
         """从磁盘加载所有会话"""
@@ -137,6 +139,14 @@ class ReActAgentService:
                 self.sessions[session.session_id] = session
             except Exception as e:
                 print(f"Error loading session {file_path}: {e}")
+
+    def _generate_title(self, user_input: str, ai_response: str) -> str:
+        """根据用户输入生成标题 (截取前20字)"""
+        return user_input[:20].strip()
+
+    async def _agenerate_title(self, user_input: str, ai_response: str) -> str:
+        """根据用户输入生成标题 (Async, 截取前20字)"""
+        return user_input[:20].strip()
 
     def _save_session(self, session: SessionData):
         """保存会话到磁盘"""
@@ -164,14 +174,40 @@ class ReActAgentService:
         return session
 
     def delete_session(self, session_id: str) -> bool:
-        """删除会话"""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
+        """删除会话 (Robust)"""
+        try:
             file_path = self.storage_dir / f"{session_id}.json"
-            if file_path.exists():
-                file_path.unlink()
+            exists_in_memory = session_id in self.sessions
+            exists_on_disk = file_path.exists()
+
+            if not exists_in_memory and not exists_on_disk:
+                return False
+
+            # 1. 清除向量库 (不阻断)
+            try:
+                from app.services.vector_service import get_vector_service
+                vs = get_vector_service()
+                vs.clear_session_collection(session_id)
+            except Exception as e:
+                print(f"[Warning] Failed to clear vector store for {session_id}: {e}")
+
+            # 2. 从内存删除
+            if exists_in_memory:
+                del self.sessions[session_id]
+
+            # 3. 从磁盘删除
+            if exists_on_disk:
+                try:
+                    file_path.unlink()
+                except PermissionError:
+                    print(f"[Error] Permission denied deleting {file_path}. File might be in use.")
+                except Exception as e:
+                    print(f"[Error] Failed to delete file {file_path}: {e}")
+
             return True
-        return False
+        except Exception as e:
+            print(f"[Fatal] delete_session error: {e}")
+            return False
     
     def list_sessions(self) -> List[dict]:
         """列出所有会话"""
@@ -207,12 +243,18 @@ class ReActAgentService:
         session = self.get_session(session_id)
         return session.uploaded_documents
 
-    def _build_graph(self) -> StateGraph:
-        """构建LangGraph工作流"""
+    def _build_graph(self, use_tools: bool = True) -> StateGraph:
+        """构建LangGraph工作流
+        
+        Args:
+            use_tools: 是否启用工具调用
+        """
+        # 根据参数选择使用的 LLM
+        llm = self.llm_with_tools if use_tools else self.llm
         
         def agent_node(state: AgentState) -> AgentState:
             messages = state["messages"]
-            response = self.llm_with_tools.invoke(messages)
+            response = llm.invoke(messages)
             return {"messages": messages + [response]}
         
         def should_continue(state: AgentState) -> str:
@@ -269,7 +311,8 @@ class ReActAgentService:
         user_input: str,
         image_base64: Optional[str] = None,
         use_rag: bool = True,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        use_tools: bool = True
     ) -> dict:
         """根据 session_id 处理用户输入"""
         try:
@@ -351,9 +394,12 @@ class ReActAgentService:
                 session_context = f"[会话上下文] 用户在当前对话中已上传以下文件: {', '.join(session.uploaded_documents)}\n\n"
                 enhanced_input = session_context + enhanced_input
 
-            # 图片提示
+            # 图片提示 (根据是否启用工具调整提示)
             if image_base64:
-                enhanced_input = f"[用户上传了一张图片，请使用图像分析工具分析图片内容]\n\n{enhanced_input}"
+                if use_tools:
+                    enhanced_input = f"[用户上传了一张图片，请使用图像分析工具分析图片内容]\n\n{enhanced_input}"
+                else:
+                    enhanced_input = f"[用户上传了一张图片，但工具调用已禁用，无法进行图像分析]\n\n{enhanced_input}"
             
             messages.append(HumanMessage(content=enhanced_input))
             
@@ -363,7 +409,9 @@ class ReActAgentService:
                 "retrieved_docs": retrieved_docs,
                 "tool_calls_log": []
             }
-            result = self.graph.invoke(initial_state)
+            # 根据 use_tools 选择工作流
+            graph = self.graph_with_tools if use_tools else self.graph_no_tools
+            result = graph.invoke(initial_state)
             
             # 提取响应
             final_messages = result["messages"]
@@ -376,6 +424,11 @@ class ReActAgentService:
             # 更新历史并保存
             session.history.append(HumanMessage(content=user_input))
             session.history.append(AIMessage(content=final_response))
+            
+            # 如果是第一轮对话，生成标题
+            if len(session.history) <= 2:
+                session.name = self._generate_title(user_input, final_response)
+
             # 限制历史长度
             if len(session.history) > 20:
                 session.history = session.history[-20:]
@@ -405,7 +458,8 @@ class ReActAgentService:
         user_input: str,
         image_base64: Optional[str] = None,
         use_rag: bool = True,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        use_tools: bool = True
     ):
         """流式对话生成器 (Async)"""
         try:
@@ -478,8 +532,12 @@ class ReActAgentService:
                 session_context = f"[会话上下文] 用户在当前对话中已上传以下文件: {', '.join(session.uploaded_documents)}\n\n"
                 enhanced_input = session_context + enhanced_input
 
+            # 图片提示 (根据是否启用工具调整提示)
             if image_base64:
-                enhanced_input = f"[用户上传了一张图片，请使用图像分析工具分析图片内容]\n\n{enhanced_input}"
+                if use_tools:
+                    enhanced_input = f"[用户上传了一张图片，请使用图像分析工具分析图片内容]\n\n{enhanced_input}"
+                else:
+                    enhanced_input = f"[用户上传了一张图片，但工具调用已禁用，无法进行图像分析]\n\n{enhanced_input}"
             
             messages.append(HumanMessage(content=enhanced_input))
             
@@ -496,11 +554,12 @@ class ReActAgentService:
                 "retrieved_docs": retrieved_docs
             }) + "\n"
             
-            # 3. 流式生成
+            # 3. 流式生成 - 根据 use_tools 选择工作流
             final_response = ""
+            graph = self.graph_with_tools if use_tools else self.graph_no_tools
             
             # 使用 astream_events 获取详细事件流
-            async for event in self.graph.astream_events(initial_state, version="v2"):
+            async for event in graph.astream_events(initial_state, version="v2"):
                 kind = event["event"]
                 
                 # 监听 Chat Model 的流式输出
@@ -514,6 +573,11 @@ class ReActAgentService:
             # 4. 更新历史并保存
             session.history.append(HumanMessage(content=user_input))
             session.history.append(AIMessage(content=final_response))
+            
+            # 如果是第一轮对话，生成标题 (Async)
+            if len(session.history) <= 2:
+                session.name = await self._agenerate_title(user_input, final_response)
+
             if len(session.history) > 20:
                 session.history = session.history[-20:]
             self._save_session(session)
